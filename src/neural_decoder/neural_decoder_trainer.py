@@ -1,3 +1,4 @@
+import math
 import os
 import pickle
 import time
@@ -11,6 +12,7 @@ from torch.utils.data import DataLoader
 import wandb
 
 from .model import GRUDecoder
+from .transformer_ctc import NeuralTransformerCTCModel
 from .dataset import SpeechDataset
 
 
@@ -56,6 +58,14 @@ def getDatasetLoaders(
 
     return train_loader, test_loader, loadedData
 
+
+def _compute_output_lengths(model, x_lens):
+    if hasattr(model, "compute_output_lengths"):
+        return model.compute_output_lengths(x_lens)
+    else:
+        return ((x_lens - model.kernelLen) / model.strideLen).to(torch.int32)
+
+
 def trainModel(args):
     os.makedirs(args["outputDir"], exist_ok=True)
     torch.manual_seed(args["seed"])
@@ -77,37 +87,78 @@ def trainModel(args):
         args["batchSize"],
     )
 
-    model = GRUDecoder(
-        neural_dim=args["nInputFeatures"],
-        n_classes=args["nClasses"],
-        hidden_dim=args["nUnits"],
-        layer_dim=args["nLayers"],
-        nDays=len(loadedData["train"]),
-        dropout=args["dropout"],
-        device=device,
-        strideLen=args["strideLen"],
-        kernelLen=args["kernelLen"],
-        gaussianSmoothWidth=args["gaussianSmoothWidth"],
-        bidirectional=args["bidirectional"],
-    ).to(device)
+    if args.get("model_type", "gru_baseline") == "transformer_ctc":
+        model = NeuralTransformerCTCModel(
+            n_channels=args["nInputFeatures"],
+            n_classes=args["nClasses"] + 1,  # CTC blank already added in GRU; align dimensions
+            n_days=len(loadedData["train"]),
+            use_wavelets=args.get("use_wavelets", True),
+            n_scales=args.get("wavelet_n_scales", 4),
+            wavelet_window_bins=args.get("wavelet_window_bins", 5),
+            wavelet_stride_bins=args.get("wavelet_stride_bins", 1),
+            use_pac_features=args.get("use_pac_features", False),
+            frontend_dim=args.get("frontend_dim", 512),
+            latent_dim=args.get("latent_dim", 256),
+            transformer_layers=args.get("transformer_num_layers", 4),
+            transformer_heads=args.get("transformer_n_heads", 4),
+            transformer_ff_dim=args.get("transformer_dim_ff", 1024),
+            transformer_dropout=args.get("transformer_dropout", 0.1),
+            device=device,
+        ).to(device)
+    else:
+        model = GRUDecoder(
+            neural_dim=args["nInputFeatures"],
+            n_classes=args["nClasses"],
+            hidden_dim=args["nUnits"],
+            layer_dim=args["nLayers"],
+            nDays=len(loadedData["train"]),
+            dropout=args["dropout"],
+            device=device,
+            strideLen=args["strideLen"],
+            kernelLen=args["kernelLen"],
+            gaussianSmoothWidth=args["gaussianSmoothWidth"],
+            bidirectional=args["bidirectional"],
+        ).to(device)
 
     # Watch model with wandb
     wandb.watch(model, log="all", log_freq=100)
 
-    loss_ctc = torch.nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=args["lrStart"],
-        betas=(0.9, 0.999),
-        eps=0.1,
-        weight_decay=args["l2_decay"],
-    )
-    scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=1.0,
-        end_factor=args["lrEnd"] / args["lrStart"],
-        total_iters=args["nBatch"],
-    )
+    blank_idx = 0
+    n_classes = args["nClasses"] + 1  # +1 blank
+    loss_ctc = torch.nn.CTCLoss(blank=blank_idx, reduction="mean", zero_infinity=True)
+
+    if args.get("optimizer", "adam") == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args["lrStart"],
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=args.get("weight_decay", args.get("l2_decay", 0)),
+        )
+        warmup_steps = int(args.get("warmup_steps", 0))
+        total_steps = args["nBatch"]
+
+        def lr_lambda(step):
+            if warmup_steps > 0 and step < warmup_steps:
+                return float(step + 1) / float(max(1, warmup_steps))
+            progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=args["lrStart"],
+            betas=(0.9, 0.999),
+            eps=0.1,
+            weight_decay=args["l2_decay"],
+        )
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=args["lrEnd"] / args["lrStart"],
+            total_iters=args["nBatch"],
+        )
 
     # --train--
     testLoss = []
@@ -136,12 +187,17 @@ def trainModel(args):
             )
 
         # Compute prediction error
-        pred = model.forward(X, dayIdx)
+        if args.get("model_type", "gru_baseline") == "transformer_ctc":
+            log_probs, out_lens = model(X, dayIdx, X_len)
+        else:
+            pred = model.forward(X, dayIdx)
+            out_lens = ((X_len - model.kernelLen) / model.strideLen).to(torch.int32)
+            log_probs = pred.log_softmax(2).permute(1, 0, 2)
 
         loss = loss_ctc(
-            torch.permute(pred.log_softmax(2), [1, 0, 2]),
+            log_probs,
             y,
-            ((X_len - model.kernelLen) / model.strideLen).to(torch.int32),
+            out_lens,
             y_len,
         )
         loss = torch.sum(loss)
@@ -175,22 +231,28 @@ def trainModel(args):
                         testDayIdx.to(device),
                     )
 
-                    pred = model.forward(X, testDayIdx)
+                    if args.get("model_type", "gru_baseline") == "transformer_ctc":
+                        pred, adjustedLens = model(X, testDayIdx, X_len)
+                        # pred already [T, B, C]
+                    else:
+                        logits = model.forward(X, testDayIdx)
+                        adjustedLens = ((X_len - model.kernelLen) / model.strideLen).to(
+                            torch.int32
+                        )
+                        pred = logits.log_softmax(2).permute(1, 0, 2)
+
                     loss = loss_ctc(
-                        torch.permute(pred.log_softmax(2), [1, 0, 2]),
+                        pred,
                         y,
-                        ((X_len - model.kernelLen) / model.strideLen).to(torch.int32),
+                        adjustedLens,
                         y_len,
                     )
                     loss = torch.sum(loss)
                     allLoss.append(loss.cpu().detach().numpy())
 
-                    adjustedLens = ((X_len - model.kernelLen) / model.strideLen).to(
-                        torch.int32
-                    )
-                    for iterIdx in range(pred.shape[0]):
+                    for iterIdx in range(pred.shape[1]):  # pred is [T, B, C]
                         decodedSeq = torch.argmax(
-                            torch.tensor(pred[iterIdx, 0 : adjustedLens[iterIdx], :]),
+                            torch.tensor(pred[0 : adjustedLens[iterIdx], iterIdx, :]),
                             dim=-1,
                         )  # [num_seq,]
                         decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
@@ -248,19 +310,38 @@ def loadModel(modelDir, nInputLayers=24, device="cuda"):
     with open(modelDir + "/args", "rb") as handle:
         args = pickle.load(handle)
 
-    model = GRUDecoder(
-        neural_dim=args["nInputFeatures"],
-        n_classes=args["nClasses"],
-        hidden_dim=args["nUnits"],
-        layer_dim=args["nLayers"],
-        nDays=nInputLayers,
-        dropout=args["dropout"],
-        device=device,
-        strideLen=args["strideLen"],
-        kernelLen=args["kernelLen"],
-        gaussianSmoothWidth=args["gaussianSmoothWidth"],
-        bidirectional=args["bidirectional"],
-    ).to(device)
+    if args.get("model_type", "gru_baseline") == "transformer_ctc":
+        model = NeuralTransformerCTCModel(
+            n_channels=args["nInputFeatures"],
+            n_classes=args["nClasses"] + 1,
+            n_days=nInputLayers,
+            use_wavelets=args.get("use_wavelets", True),
+            n_scales=args.get("wavelet_n_scales", 4),
+            wavelet_window_bins=args.get("wavelet_window_bins", 5),
+            wavelet_stride_bins=args.get("wavelet_stride_bins", 1),
+            use_pac_features=args.get("use_pac_features", False),
+            frontend_dim=args.get("frontend_dim", 512),
+            latent_dim=args.get("latent_dim", 256),
+            transformer_layers=args.get("transformer_num_layers", 4),
+            transformer_heads=args.get("transformer_n_heads", 4),
+            transformer_ff_dim=args.get("transformer_dim_ff", 1024),
+            transformer_dropout=args.get("transformer_dropout", 0.1),
+            device=device,
+        ).to(device)
+    else:
+        model = GRUDecoder(
+            neural_dim=args["nInputFeatures"],
+            n_classes=args["nClasses"],
+            hidden_dim=args["nUnits"],
+            layer_dim=args["nLayers"],
+            nDays=nInputLayers,
+            dropout=args["dropout"],
+            device=device,
+            strideLen=args["strideLen"],
+            kernelLen=args["kernelLen"],
+            gaussianSmoothWidth=args["gaussianSmoothWidth"],
+            bidirectional=args["bidirectional"],
+        ).to(device)
 
     model.load_state_dict(torch.load(modelWeightPath, map_location=device))
     return model

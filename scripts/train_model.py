@@ -1,5 +1,5 @@
 
-modelName = 'speechBaseline4'
+modelName = 'transformer_wavelet_ctc'
 
 args = {}
 args['outputDir'] = '//home/edward/neural_seq_decoder/logs/speech_logs/' + modelName
@@ -23,6 +23,22 @@ args['strideLen'] = 4
 args['kernelLen'] = 32
 args['bidirectional'] = True
 args['l2_decay'] = 1e-5
+args['model_type'] = 'transformer_ctc'
+# Transformer / frontend defaults
+args['use_wavelets'] = True
+args['use_pac_features'] = False
+args['wavelet_n_scales'] = 4
+args['wavelet_window_bins'] = 5
+args['wavelet_stride_bins'] = 1
+args['frontend_dim'] = 512
+args['latent_dim'] = 256
+args['transformer_num_layers'] = 4
+args['transformer_n_heads'] = 4
+args['transformer_dim_ff'] = 1024
+args['transformer_dropout'] = 0.1
+args['optimizer'] = 'adamw'
+args['weight_decay'] = 1e-2
+args['warmup_steps'] = 500
 
 from neural_decoder.neural_decoder_trainer import trainModel
 
