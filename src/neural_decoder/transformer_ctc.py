@@ -1,6 +1,7 @@
 import math
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -30,79 +31,98 @@ class DaySpecificLinear(nn.Module):
         return torch.einsum("btd,bdk->btk", x, day_w) + day_b
 
 
-def _build_wavelet_filters(
-    wavelet_name: str, n_scales: int, n_channels: int, device: torch.device, dtype: torch.dtype
-) -> Tuple[torch.Tensor, list]:
-    wave = pywt.Wavelet(wavelet_name)
-    base_filter = torch.tensor(wave.dec_hi[::-1], device=device, dtype=dtype)  # high-pass reconstruction kernel
-    filters = []
-    dilations = []
-    for s in range(n_scales):
-        dilation = 2**s
-        dilations.append(dilation)
-        filt = base_filter.view(1, 1, -1).repeat(n_channels, 1, 1)  # [C, 1, K]
-        filters.append(filt)
-    stacked = torch.stack(filters, dim=0)  # [S, C, 1, K]
-    return stacked, dilations
-
-
 class WaveletFeatureExtractor(nn.Module):
     """
-    Computes per-scale wavelet energy features with db4 filters and optional temporal smoothing.
+    Fast GPU-based wavelet-inspired feature extractor using learned filter banks.
+    Approximates wavelet decomposition with trainable convolutional filters at multiple scales.
+    Much faster than pywt.wavedec while maintaining the spirit of MiSTR's approach.
     """
 
     def __init__(
         self,
         n_channels: int,
         n_scales: int = 4,
-        window_bins: int = 5,
-        stride_bins: int = 1,
         wavelet_name: str = "db4",
+        window_size: int = 10,
     ):
         super().__init__()
-        if stride_bins != 1:
-            raise ValueError("wavelet_stride_bins must be 1 to keep sequence lengths aligned with raw features.")
         self.n_channels = n_channels
         self.n_scales = n_scales
-        self.window_bins = window_bins
-        self.stride_bins = stride_bins
-        # buffers initialized lazily because device/dtype are unknown here
-        self.register_buffer("filters", None, persistent=False)
-        self.dilations = None
-        self.wavelet_name = wavelet_name
+        self.window_size = window_size
 
-    def _lazy_init_filters(self, x: torch.Tensor):
-        if self.filters is None:
-            filt, dilations = _build_wavelet_filters(
-                self.wavelet_name, self.n_scales, self.n_channels, x.device, x.dtype
+        # Initialize filter banks based on wavelet
+        wave = pywt.Wavelet(wavelet_name)
+
+        # Create multi-scale filters inspired by wavelet decomposition
+        # Each scale has both high-pass (detail) and low-pass components
+        self.filters = nn.ModuleList()
+
+        for scale in range(n_scales):
+            # Dilation increases with scale (2^scale)
+            dilation = 2 ** scale
+
+            # High-pass filter (detail coefficients)
+            hi_filter = torch.tensor(wave.dec_hi, dtype=torch.float32)
+            kernel_size = len(hi_filter)
+
+            # Create 1D conv with groups for efficiency
+            conv = nn.Conv1d(
+                in_channels=n_channels,
+                out_channels=n_channels,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                padding=(kernel_size - 1) * dilation // 2,
+                groups=n_channels,  # Depthwise conv
+                bias=False
             )
-            self.register_buffer("filters", filt, persistent=False)
-            self.dilations = dilations
+
+            # Initialize with wavelet filter (learnable - gradient clipping provides stability)
+            with torch.no_grad():
+                for i in range(n_channels):
+                    conv.weight[i, 0, :] = hi_filter
+
+            self.filters.append(conv)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [B, T, C]
-        returns: [B, T_out, C * n_scales]
+        returns: [B, T, C * n_scales] - wavelet-inspired features per scale
         """
-        self._lazy_init_filters(x)
         b, t, c = x.shape
-        x_t = x.transpose(1, 2)  # [B, C, T]
-        feats = []
-        for s in range(self.n_scales):
-            filt = self.filters[s]
-            dilation = self.dilations[s]
-            padding = ((filt.shape[-1] - 1) * dilation) // 2
-            conv = F.conv1d(x_t, filt, padding=padding, stride=self.stride_bins, groups=c, dilation=dilation)
-            energy = conv.pow(2)
-            if self.window_bins > 1:
-                # smooth energy to reduce noise, keep stride at 1 in time dimension of conv output
-                pad = self.window_bins // 2
-                energy = F.avg_pool1d(energy, kernel_size=self.window_bins, stride=1, padding=pad)
-            feats.append(energy)
 
-        # feats: list of [B, C, T_out]; concat on channel dim -> [B, C*S, T_out] then transpose back
-        feat_cat = torch.cat(feats, dim=1).transpose(1, 2)
-        return feat_cat
+        # Transpose for conv1d: [B, C, T]
+        x_t = x.transpose(1, 2)
+
+        scale_features = []
+        for scale_conv in self.filters:
+            # Apply filter at this scale
+            filtered = scale_conv(x_t)  # [B, C, T]
+
+            # Compute energy (square of coefficients)
+            energy = filtered.pow(2)
+
+            # Optional: smooth with small window
+            if self.window_size > 1:
+                energy = F.avg_pool1d(
+                    energy,
+                    kernel_size=min(self.window_size, energy.size(-1)),
+                    stride=1,
+                    padding=self.window_size // 2
+                )
+
+            # Ensure same length as input
+            if energy.size(-1) != t:
+                energy = F.interpolate(energy, size=t, mode='linear', align_corners=False)
+
+            scale_features.append(energy)
+
+        # Concatenate all scales: [B, C * n_scales, T]
+        features = torch.cat(scale_features, dim=1)
+
+        # Transpose back: [B, T, C * n_scales]
+        features = features.transpose(1, 2)
+
+        return features
 
 
 class PACFeatureExtractor(nn.Module):
@@ -191,8 +211,7 @@ class NeuralFrontend(nn.Module):
         n_channels: int,
         use_wavelets: bool = True,
         n_scales: int = 4,
-        wavelet_window_bins: int = 5,
-        wavelet_stride_bins: int = 1,
+        wavelet_window_size: int = 10,
         use_pac_features: bool = False,
         pac_low: Tuple[float, float] = (4.0, 8.0),
         pac_high: Tuple[float, float] = (70.0, 170.0),
@@ -200,18 +219,46 @@ class NeuralFrontend(nn.Module):
         pac_smoothing_bins: int = 5,
         frontend_dim: int = 512,
         dropout: float = 0.1,
+        temporal_kernel: int = 0,
+        temporal_stride: int = 1,  # Add striding like GRU (stride=4)
+        gaussian_smooth_width: float = 0.0,  # GRU uses 2.0
     ):
         super().__init__()
         self.use_wavelets = use_wavelets
         self.use_pac_features = use_pac_features
         self.n_channels = n_channels
+        self.temporal_kernel = temporal_kernel
+        self.temporal_stride = temporal_stride
+
+        # Gaussian smoothing (like GRU preprocessing)
+        if gaussian_smooth_width > 0:
+            kernel_size = int(gaussian_smooth_width * 4) + 1  # 4 sigma window
+            gaussian_kernel = self._make_gaussian_kernel(kernel_size, gaussian_smooth_width)
+            self.register_buffer('gaussian_kernel', gaussian_kernel.view(1, 1, -1))
+            self.gaussian_padding = kernel_size // 2
+        else:
+            self.gaussian_kernel = None
+
+        # Strided temporal convolution (like GRU's kernel + stride)
+        if temporal_kernel > 0:
+            self.temporal_conv = nn.Conv1d(
+                n_channels, n_channels,
+                kernel_size=temporal_kernel,
+                stride=temporal_stride,  # Add stride!
+                padding=temporal_kernel // 2,
+                groups=n_channels,
+                bias=False
+            )
+            nn.init.constant_(self.temporal_conv.weight, 1.0 / temporal_kernel)
+        else:
+            self.temporal_conv = None
 
         if use_wavelets:
             self.wavelet_extractor = WaveletFeatureExtractor(
                 n_channels=n_channels,
                 n_scales=n_scales,
-                window_bins=wavelet_window_bins,
-                stride_bins=wavelet_stride_bins,
+                wavelet_name="db4",
+                window_size=wavelet_window_size,
             )
             wavelet_dim = n_channels * n_scales
         else:
@@ -223,7 +270,7 @@ class NeuralFrontend(nn.Module):
                 n_channels=n_channels,
                 low_band=pac_low,
                 high_band=pac_high,
-                sample_rate=50.0,  # 20 ms bins
+                sample_rate=50.0,
                 filter_len=pac_filter_len,
                 smoothing_bins=pac_smoothing_bins,
             )
@@ -237,12 +284,42 @@ class NeuralFrontend(nn.Module):
         self.ln = nn.LayerNorm(frontend_dim)
         self.dropout = nn.Dropout(dropout)
 
+    def _make_gaussian_kernel(self, kernel_size: int, sigma: float) -> torch.Tensor:
+        """Create 1D Gaussian kernel for smoothing"""
+        x = torch.arange(kernel_size, dtype=torch.float32) - (kernel_size - 1) / 2
+        gauss = torch.exp(-x.pow(2) / (2 * sigma ** 2))
+        return gauss / gauss.sum()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = [x]
+        # Apply Gaussian smoothing first (like GRU preprocessing)
+        if self.gaussian_kernel is not None:
+            x_t = x.transpose(1, 2)  # [B, C, T]
+            # Apply same Gaussian kernel to all channels
+            kernel = self.gaussian_kernel.repeat(self.n_channels, 1, 1)  # [C, 1, K]
+            x_smooth = F.conv1d(x_t, kernel, padding=self.gaussian_padding, groups=self.n_channels)
+            x = x_smooth.transpose(1, 2)  # [B, T, C]
+
+        # Apply temporal smoothing/striding (like GRU's kernel + stride processing)
+        if self.temporal_conv is not None:
+            # x: [B, T, C] -> [B, C, T] for conv1d
+            x_t = x.transpose(1, 2)
+            x_smooth = self.temporal_conv(x_t).transpose(1, 2)  # [B, T', C] where T' = T/stride
+            # Compute additional features on the strided output
+            x_for_features = x_smooth
+        else:
+            x_for_features = x
+
+        feats = [x_for_features]
+
         if self.wavelet_extractor is not None:
-            feats.append(self.wavelet_extractor(x))
+            wavelet_feats = self.wavelet_extractor(x_for_features)  # [B, T', C * n_scales]
+            feats.append(wavelet_feats)
+
         if self.pac_extractor is not None:
-            feats.append(self.pac_extractor(x))
+            pac_feats = self.pac_extractor(x_for_features)  # [B, T', C]
+            feats.append(pac_feats)
+
+        # All features now have same temporal dimension [B, T', ...]
         x_cat = torch.cat(feats, dim=-1)
         x_proj = self.proj(x_cat)
         x_proj = self.ln(x_proj)
@@ -253,11 +330,11 @@ class NeuralFrontend(nn.Module):
 class AutoEncoderEncoder(nn.Module):
     """
     Simple MLP encoder (MiSTR-style) used as a bottleneck projection.
+    Uses fixed 128 hidden units as in original MiSTR implementation.
     """
 
-    def __init__(self, input_dim: int, latent_dim: int):
+    def __init__(self, input_dim: int, latent_dim: int, hidden_dim: int = 128):
         super().__init__()
-        hidden_dim = max(latent_dim * 2, input_dim // 2)
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -268,7 +345,119 @@ class AutoEncoderEncoder(nn.Module):
         return self.net(x)
 
 
+class ConformerConvModule(nn.Module):
+    """
+    Convolution module from Conformer architecture.
+    Provides local pattern modeling to complement global attention.
+    """
+    def __init__(self, d_model: int, kernel_size: int = 31, dropout: float = 0.1):
+        super().__init__()
+        # Layernorm
+        self.ln = nn.LayerNorm(d_model)
+        # Pointwise conv (expansion)
+        self.pw_conv1 = nn.Linear(d_model, d_model * 2)
+        # GLU activation
+        self.glu = nn.GLU(dim=-1)
+        # Depthwise conv
+        self.dw_conv = nn.Conv1d(
+            d_model, d_model,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=d_model,
+        )
+        self.ln_conv = nn.LayerNorm(d_model)  # Use LayerNorm instead of BatchNorm for stability
+        self.activation = nn.SiLU()
+        # Pointwise conv (projection)
+        self.pw_conv2 = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, D]
+        residual = x
+        x = self.ln(x)
+        x = self.pw_conv1(x)  # [B, T, 2D]
+        x = self.glu(x)  # [B, T, D]
+
+        # Depthwise conv requires [B, D, T]
+        x = x.transpose(1, 2)  # [B, D, T]
+        x = self.dw_conv(x)  # [B, D, T]
+        x = x.transpose(1, 2)  # [B, T, D]
+        x = self.ln_conv(x)  # LayerNorm for stability
+        x = self.activation(x)
+
+        x = self.pw_conv2(x)
+        x = self.dropout(x)
+        return residual + x
+
+
+class ConformerBlock(nn.Module):
+    """
+    Conformer block: Feed-forward + Multi-head Attention + Convolution + Feed-forward
+    """
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int,
+        dropout: float = 0.1,
+        conv_kernel_size: int = 31,
+    ):
+        super().__init__()
+        # First feed-forward module (half-step residual)
+        self.ff1 = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, dim_feedforward),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+        # Multi-head self-attention
+        self.ln_attn = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.dropout_attn = nn.Dropout(dropout)
+
+        # Convolution module
+        self.conv_module = ConformerConvModule(d_model, conv_kernel_size, dropout)
+
+        # Second feed-forward module (half-step residual)
+        self.ff2 = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, dim_feedforward),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+        self.ln_final = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, src_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # x: [B, T, D]
+        # First FF module (half-step)
+        x = x + 0.5 * self.ff1(x)
+
+        # Multi-head attention
+        x_attn = self.ln_attn(x)
+        attn_out, _ = self.attn(x_attn, x_attn, x_attn, key_padding_mask=src_key_padding_mask)
+        x = x + self.dropout_attn(attn_out)
+
+        # Convolution module
+        x = self.conv_module(x)
+
+        # Second FF module (half-step)
+        x = x + 0.5 * self.ff2(x)
+
+        x = self.ln_final(x)
+        return x
+
+
 class PositionalEncoding(nn.Module):
+    """
+    Standard sinusoidal positional encoding (proven to work well).
+    """
+
     def __init__(self, d_model: int, max_len: int = 5000):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
@@ -296,47 +485,84 @@ class NeuralTransformerCTCModel(nn.Module):
         n_days: int,
         use_wavelets: bool = True,
         n_scales: int = 4,
-        wavelet_window_bins: int = 5,
-        wavelet_stride_bins: int = 1,
+        wavelet_window_size: int = 10,
         use_pac_features: bool = False,
         frontend_dim: int = 512,
         latent_dim: int = 256,
+        autoencoder_hidden_dim: int = 128,
         transformer_layers: int = 6,
         transformer_heads: int = 4,
         transformer_ff_dim: int = 1024,
         transformer_dropout: float = 0.1,
+        temporal_kernel: int = 0,  # Temporal convolution kernel size
+        temporal_stride: int = 1,  # Temporal convolution stride
+        gaussian_smooth_width: float = 0.0,  # GRU uses 2.0
+        use_conformer: bool = False,  # Use Conformer blocks instead of standard transformer
+        conformer_conv_kernel: int = 31,  # Conformer convolution kernel size
         device: str = "cuda",
     ):
         super().__init__()
         self.device_name = device
+        self.use_conformer = use_conformer
         self.day_linear = DaySpecificLinear(n_days=n_days, dim=n_channels, init_identity=True)
         self.frontend = NeuralFrontend(
             n_channels=n_channels,
             use_wavelets=use_wavelets,
             n_scales=n_scales,
-            wavelet_window_bins=wavelet_window_bins,
-            wavelet_stride_bins=wavelet_stride_bins,
+            wavelet_window_size=wavelet_window_size,
             use_pac_features=use_pac_features,
             frontend_dim=frontend_dim,
+            temporal_kernel=temporal_kernel,
+            temporal_stride=temporal_stride,
+            gaussian_smooth_width=gaussian_smooth_width,
         )
-        self.encoder = AutoEncoderEncoder(input_dim=frontend_dim, latent_dim=latent_dim)
+        self.encoder = AutoEncoderEncoder(
+            input_dim=frontend_dim, latent_dim=latent_dim, hidden_dim=autoencoder_hidden_dim
+        )
         self.pos_enc = PositionalEncoding(d_model=latent_dim)
 
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=latent_dim,
-            nhead=transformer_heads,
-            dim_feedforward=transformer_ff_dim,
-            dropout=transformer_dropout,
-            batch_first=True,
-            activation="relu",
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=transformer_layers)
+        if use_conformer:
+            # Use Conformer blocks
+            self.conformer_layers = nn.ModuleList([
+                ConformerBlock(
+                    d_model=latent_dim,
+                    nhead=transformer_heads,
+                    dim_feedforward=transformer_ff_dim,
+                    dropout=transformer_dropout,
+                    conv_kernel_size=conformer_conv_kernel,
+                )
+                for _ in range(transformer_layers)
+            ])
+            self.transformer = None
+        else:
+            # Use standard transformer
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=latent_dim,
+                nhead=transformer_heads,
+                dim_feedforward=transformer_ff_dim,
+                dropout=transformer_dropout,
+                batch_first=True,
+                activation="relu",
+                norm_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(enc_layer, num_layers=transformer_layers)
+            self.conformer_layers = None
+
         self.output = nn.Linear(latent_dim, n_classes)
 
-    def compute_output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:
-        # Frontend uses stride 1 by default; lengths unchanged.
-        return input_lengths
+    def compute_output_lengths(self, input_lengths: torch.Tensor, actual_seq_len: int) -> torch.Tensor:
+        # Account for temporal striding in frontend (if used)
+        if hasattr(self.frontend, 'temporal_conv') and self.frontend.temporal_conv is not None:
+            # Apply same formula as GRU: (length - kernel) / stride
+            kernel = self.frontend.temporal_kernel
+            stride = self.frontend.temporal_stride
+            output_lengths = ((input_lengths - kernel) / stride).to(torch.int32)
+        else:
+            # No striding, temporal dimension preserved
+            output_lengths = input_lengths
+
+        # Clamp to actual sequence length
+        return torch.clamp(output_lengths, max=actual_seq_len)
 
     def forward(
         self,
@@ -350,14 +576,28 @@ class NeuralTransformerCTCModel(nn.Module):
         z = self.encoder(feats)
         z = self.pos_enc(z)
 
+        # Get actual sequence length after frontend processing
+        actual_seq_len = z.size(1)
+
         padding_mask = None
         if input_lengths is not None:
+            # Update input_lengths to reflect actual output size
+            out_lengths = self.compute_output_lengths(input_lengths, actual_seq_len)
             max_len = z.size(1)
-            mask = torch.arange(max_len, device=z.device).expand(len(input_lengths), max_len) >= input_lengths.unsqueeze(1)
+            mask = torch.arange(max_len, device=z.device).expand(len(out_lengths), max_len) >= out_lengths.unsqueeze(1)
             padding_mask = mask  # [B, T]
+        else:
+            out_lengths = None
 
-        z_enc = self.transformer(z, src_key_padding_mask=padding_mask)
+        if self.use_conformer:
+            # Apply Conformer blocks
+            for layer in self.conformer_layers:
+                z = layer(z, src_key_padding_mask=padding_mask)
+            z_enc = z
+        else:
+            # Use standard transformer
+            z_enc = self.transformer(z, src_key_padding_mask=padding_mask)
+
         logits = self.output(z_enc)  # [B, T, C]
         log_probs = logits.log_softmax(dim=-1).transpose(0, 1)  # [T, B, C]
-        out_lengths = self.compute_output_lengths(input_lengths) if input_lengths is not None else None
         return log_probs, out_lengths

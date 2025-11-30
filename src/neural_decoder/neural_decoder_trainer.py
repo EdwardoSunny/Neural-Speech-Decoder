@@ -94,15 +94,20 @@ def trainModel(args):
             n_days=len(loadedData["train"]),
             use_wavelets=args.get("use_wavelets", True),
             n_scales=args.get("wavelet_n_scales", 4),
-            wavelet_window_bins=args.get("wavelet_window_bins", 5),
-            wavelet_stride_bins=args.get("wavelet_stride_bins", 1),
+            wavelet_window_size=args.get("wavelet_window_size", 10),
             use_pac_features=args.get("use_pac_features", False),
             frontend_dim=args.get("frontend_dim", 512),
             latent_dim=args.get("latent_dim", 256),
+            autoencoder_hidden_dim=args.get("autoencoder_hidden_dim", 128),
             transformer_layers=args.get("transformer_num_layers", 4),
             transformer_heads=args.get("transformer_n_heads", 4),
             transformer_ff_dim=args.get("transformer_dim_ff", 1024),
             transformer_dropout=args.get("transformer_dropout", 0.1),
+            temporal_kernel=args.get("temporal_kernel", 0),
+            temporal_stride=args.get("temporal_stride", 1),
+            gaussian_smooth_width=args.get("gaussian_smooth_width", 0.0),
+            use_conformer=args.get("use_conformer", False),
+            conformer_conv_kernel=args.get("conformer_conv_kernel", 31),
             device=device,
         ).to(device)
     else:
@@ -125,7 +130,14 @@ def trainModel(args):
 
     blank_idx = 0
     n_classes = args["nClasses"] + 1  # +1 blank
-    loss_ctc = torch.nn.CTCLoss(blank=blank_idx, reduction="mean", zero_infinity=True)
+
+    # Label smoothing for better generalization
+    label_smoothing = args.get("label_smoothing", 0.0)
+    if label_smoothing > 0:
+        # CTCLoss doesn't support label smoothing directly, so we'll apply it manually
+        loss_ctc = torch.nn.CTCLoss(blank=blank_idx, reduction="none", zero_infinity=True)
+    else:
+        loss_ctc = torch.nn.CTCLoss(blank=blank_idx, reduction="mean", zero_infinity=True)
 
     if args.get("optimizer", "adam") == "adamw":
         optimizer = torch.optim.AdamW(
@@ -200,11 +212,25 @@ def trainModel(args):
             out_lens,
             y_len,
         )
-        loss = torch.sum(loss)
+
+        # Apply label smoothing if enabled
+        if label_smoothing > 0:
+            # CTC loss + uniform distribution over non-blank classes
+            ctc_loss = torch.mean(loss)
+            # Compute KL divergence from uniform distribution (label smoothing)
+            uniform_dist = torch.full_like(log_probs, -math.log(n_classes))
+            kl_div = F.kl_div(log_probs, uniform_dist, reduction='batchmean', log_target=True)
+            loss = (1 - label_smoothing) * ctc_loss + label_smoothing * kl_div
+        else:
+            loss = torch.sum(loss)
 
         # Backpropagation
         optimizer.zero_grad()
         loss.backward()
+
+        # Gradient clipping to prevent explosion
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
         scheduler.step()
 
@@ -317,15 +343,20 @@ def loadModel(modelDir, nInputLayers=24, device="cuda"):
             n_days=nInputLayers,
             use_wavelets=args.get("use_wavelets", True),
             n_scales=args.get("wavelet_n_scales", 4),
-            wavelet_window_bins=args.get("wavelet_window_bins", 5),
-            wavelet_stride_bins=args.get("wavelet_stride_bins", 1),
+            wavelet_window_size=args.get("wavelet_window_size", 10),
             use_pac_features=args.get("use_pac_features", False),
             frontend_dim=args.get("frontend_dim", 512),
             latent_dim=args.get("latent_dim", 256),
+            autoencoder_hidden_dim=args.get("autoencoder_hidden_dim", 128),
             transformer_layers=args.get("transformer_num_layers", 4),
             transformer_heads=args.get("transformer_n_heads", 4),
             transformer_ff_dim=args.get("transformer_dim_ff", 1024),
             transformer_dropout=args.get("transformer_dropout", 0.1),
+            temporal_kernel=args.get("temporal_kernel", 0),
+            temporal_stride=args.get("temporal_stride", 1),
+            gaussian_smooth_width=args.get("gaussian_smooth_width", 0.0),
+            use_conformer=args.get("use_conformer", False),
+            conformer_conv_kernel=args.get("conformer_conv_kernel", 31),
             device=device,
         ).to(device)
     else:
