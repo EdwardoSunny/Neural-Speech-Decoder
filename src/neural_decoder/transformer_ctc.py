@@ -470,11 +470,11 @@ class RelativePositionalEncoding(nn.Module):
         # x: [B, T, D]
         # For simplicity, we'll add a position-dependent bias
         # Full relative attention is more complex but this gives the benefits
-        B, T, D = x.shape
-        positions = torch.arange(T, device=x.device)
-        # Get embeddings for each position
-        pos_emb = self.rel_embeddings[self.max_len - positions.max():self.max_len + T]
-        return x + pos_emb[:T].unsqueeze(0)
+        _, T, _ = x.shape
+        # Clamp positions so we never index outside the table
+        positions = torch.arange(T, device=x.device).clamp(max=self.max_len)
+        pos_emb = self.rel_embeddings[self.max_len + positions]  # [T, D]
+        return x + pos_emb.unsqueeze(0)
 
 
 class PositionalEncoding(nn.Module):
@@ -591,19 +591,38 @@ class NeuralTransformerCTCModel(nn.Module):
         for layer_idx in self.intermediate_ctc_layers:
             self.intermediate_outputs[f"layer_{layer_idx}"] = nn.Linear(latent_dim, n_classes)
 
-    def compute_output_lengths(self, input_lengths: torch.Tensor, actual_seq_len: int) -> torch.Tensor:
-        # Account for temporal striding in frontend (if used)
+    def compute_output_lengths(
+        self,
+        input_lengths: torch.Tensor,
+        actual_seq_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Compute the temporal dimension after the frontend.
+
+        Keeping actual_seq_len optional lets external callers (e.g. trainer helpers)
+        query this without needing the runtime encoder length, while still allowing
+        us to clamp to the true size when available.
+        """
+        # Ensure computations stay on the same device as the provided lengths
+        device = input_lengths.device
+
         if hasattr(self.frontend, 'temporal_conv') and self.frontend.temporal_conv is not None:
-            # Apply same formula as GRU: (length - kernel) / stride
             kernel = self.frontend.temporal_kernel
             stride = self.frontend.temporal_stride
-            output_lengths = ((input_lengths - kernel) / stride).to(torch.int32)
+            padding = kernel // 2
+            # Standard conv1d length formula with padding, clamp to at least 1
+            numerator = input_lengths + 2 * padding - (kernel - 1) - 1
+            output_lengths = torch.div(numerator, stride, rounding_mode='floor') + 1
         else:
-            # No striding, temporal dimension preserved
             output_lengths = input_lengths
 
-        # Clamp to actual sequence length
-        return torch.clamp(output_lengths, max=actual_seq_len)
+        # Clamp to the actual encoded length if provided
+        if actual_seq_len is not None:
+            output_lengths = torch.clamp(output_lengths, min=1, max=actual_seq_len)
+        else:
+            output_lengths = torch.clamp(output_lengths, min=1)
+
+        return output_lengths.to(dtype=torch.int64, device=device)
 
     def forward(
         self,
@@ -622,6 +641,8 @@ class NeuralTransformerCTCModel(nn.Module):
 
         padding_mask = None
         if input_lengths is not None:
+            # Move lengths to the same device as the encoded sequence
+            input_lengths = input_lengths.to(z.device)
             # Update input_lengths to reflect actual output size
             out_lengths = self.compute_output_lengths(input_lengths, actual_seq_len)
             max_len = z.size(1)
@@ -774,7 +795,18 @@ class MultiScaleConformerEncoder(nn.Module):
         # Positional encoding
         self.pos_enc = RelativePositionalEncoding(d_model)
 
-    def forward(self, x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, return_all_scales: bool = False):
+    @staticmethod
+    def _conv_length(lengths: torch.Tensor, stride: int, kernel: int = 32, padding: int = 15, dilation: int = 1):
+        numerator = lengths + 2 * padding - dilation * (kernel - 1) - 1
+        return torch.div(numerator, stride, rounding_mode='floor') + 1
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_lengths: Optional[torch.Tensor] = None,
+        return_all_scales: bool = False,
+    ):
         """
         x: [B, T, C] - neural signal
         return_all_scales: if True, return individual scales AND fused (for multi-scale CTC)
@@ -786,23 +818,43 @@ class MultiScaleConformerEncoder(nn.Module):
         # x: [B, T, C] -> transpose for conv1d
         x_t = x.transpose(1, 2)  # [B, C, T]
 
+        # Compute per-scale lengths/masks if lengths provided
+        fast_mask = medium_mask = slow_mask = None
+        if input_lengths is not None:
+            fast_len = torch.clamp(self._conv_length(input_lengths, stride=2), min=1)
+            medium_len = torch.clamp(self._conv_length(input_lengths, stride=4), min=1)
+            slow_len = torch.clamp(self._conv_length(input_lengths, stride=8), min=1)
+        else:
+            fast_len = medium_len = slow_len = None
+
         # Fast pathway (stride 2)
         fast = self.fast_temporal_conv(x_t).transpose(1, 2)  # [B, T/2, D]
+        if fast_len is not None:
+            fast_len = torch.clamp(fast_len, max=fast.shape[1])
+            fast_mask = torch.arange(fast.shape[1], device=x.device).unsqueeze(0) >= fast_len.unsqueeze(1)
         fast = self.pos_enc(fast)
         for layer in self.fast_conformer:
-            fast = layer(fast, src_key_padding_mask=None)
+            fast = layer(fast, src_key_padding_mask=fast_mask)
 
         # Medium pathway (stride 4)
         medium = self.medium_temporal_conv(x_t).transpose(1, 2)  # [B, T/4, D]
+        if medium_len is not None:
+            medium_len = torch.clamp(medium_len, max=medium.shape[1])
+            medium_mask = torch.arange(medium.shape[1], device=x.device).unsqueeze(0) >= medium_len.unsqueeze(1)
+        else:
+            medium_mask = padding_mask
         medium = self.pos_enc(medium)
         for layer in self.medium_conformer:
-            medium = layer(medium, src_key_padding_mask=None)
+            medium = layer(medium, src_key_padding_mask=medium_mask)
 
         # Slow pathway (stride 8)
         slow = self.slow_temporal_conv(x_t).transpose(1, 2)  # [B, T/8, D]
+        if slow_len is not None:
+            slow_len = torch.clamp(slow_len, max=slow.shape[1])
+            slow_mask = torch.arange(slow.shape[1], device=x.device).unsqueeze(0) >= slow_len.unsqueeze(1)
         slow = self.pos_enc(slow)
         for layer in self.slow_conformer:
-            slow = layer(slow, src_key_padding_mask=None)
+            slow = layer(slow, src_key_padding_mask=slow_mask)
 
         # Fuse across scales
         fused = self.fusion(fast, medium, slow)  # [B, T/4, D]
@@ -1146,6 +1198,13 @@ class MultiScaleCTCDecoder(nn.Module):
                 d_model=d_model,
             )
 
+    @staticmethod
+    def _conv_output_lengths(lengths: torch.Tensor, kernel: int, stride: int, padding: int, dilation: int = 1):
+        """Compute conv1d output lengths for variable-length batches."""
+        numerator = lengths + 2 * padding - dilation * (kernel - 1) - 1
+        out = torch.div(numerator, stride, rounding_mode='floor') + 1
+        return torch.clamp(out, min=1)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1177,30 +1236,48 @@ class MultiScaleCTCDecoder(nn.Module):
         # Day-specific normalization
         x_normalized = []
         for i, day_id in enumerate(day_idx):
-            x_normalized.append(self.day_layer_norm[day_id](x[i:i+1]))
+            x_normalized.append(self.day_layer_norm[int(day_id.item())](x[i:i+1]))
         x = torch.cat(x_normalized, dim=0)
+
+        # Ensure lengths are on the right device if provided
+        if x_len is not None:
+            x_len = x_len.to(x.device)
 
         # Encode with multi-scale encoder
         if self.use_multiscale_ctc:
             # Get all scales for multi-scale CTC
-            encoder_scales = self.encoder(x, return_all_scales=True)
+            encoder_scales = self.encoder(x, input_lengths=x_len, return_all_scales=True)
             fast_output = encoder_scales['fast']      # [B, T_fast, D] ~75 timesteps (stride 2)
             encoder_output = encoder_scales['fused']  # [B, T_medium, D] ~38 timesteps (stride 4) - main
             slow_output = encoder_scales['slow']      # [B, T_slow, D] ~19 timesteps (stride 8)
         else:
             # Only get fused medium scale
-            encoder_output = self.encoder(x)  # [B, T', D] where T' = T/4 (medium scale)
+            encoder_output = self.encoder(x, input_lengths=x_len)  # [B, T', D] where T' = T/4 (medium scale)
 
         # Contrastive pre-training mode
         if return_contrastive_loss and self.use_contrastive_pretraining:
             return self.contrastive_module(x)
 
         # Compute output lengths for each scale
-        out_lengths = torch.full((x.shape[0],), encoder_output.shape[1], dtype=torch.long, device=x.device)
-
-        if self.use_multiscale_ctc:
-            fast_out_lengths = torch.full((x.shape[0],), fast_output.shape[1], dtype=torch.long, device=x.device)
-            slow_out_lengths = torch.full((x.shape[0],), slow_output.shape[1], dtype=torch.long, device=x.device)
+        if x_len is not None:
+            out_lengths = torch.clamp(
+                self._conv_output_lengths(x_len, kernel=32, stride=4, padding=15),
+                max=encoder_output.shape[1]
+            ).to(torch.long)
+            if self.use_multiscale_ctc:
+                fast_out_lengths = torch.clamp(
+                    self._conv_output_lengths(x_len, kernel=32, stride=2, padding=15),
+                    max=fast_output.shape[1]
+                ).to(torch.long)
+                slow_out_lengths = torch.clamp(
+                    self._conv_output_lengths(x_len, kernel=32, stride=8, padding=15),
+                    max=slow_output.shape[1]
+                ).to(torch.long)
+        else:
+            out_lengths = torch.full((x.shape[0],), encoder_output.shape[1], dtype=torch.long, device=x.device)
+            if self.use_multiscale_ctc:
+                fast_out_lengths = torch.full((x.shape[0],), fast_output.shape[1], dtype=torch.long, device=x.device)
+                slow_out_lengths = torch.full((x.shape[0],), slow_output.shape[1], dtype=torch.long, device=x.device)
 
         if self.use_marginalization:
             # PROPER DCoND APPROACH: Predict diphones, marginalize to get phonemes

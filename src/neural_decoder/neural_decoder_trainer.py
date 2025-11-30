@@ -241,8 +241,9 @@ def trainModel(args):
     # Watch model with wandb
     wandb.watch(model, log="all", log_freq=100)
 
-    blank_idx = 0
-    n_classes = args["nClasses"] + 1  # +1 blank
+    n_classes = args["nClasses"] + 1  # +1 for CTC blank
+    # All models append the blank token as the last class, so align CTCLoss to that index
+    blank_idx = n_classes - 1
 
     # Label smoothing for better generalization
     label_smoothing = args.get("label_smoothing", 0.0)
