@@ -7,6 +7,7 @@ from edit_distance import SequenceMatcher
 import hydra
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 import wandb
@@ -19,25 +20,44 @@ from .dataset import SpeechDataset
 def getDatasetLoaders(
     datasetName,
     batchSize,
+    diphone_vocab=None,
 ):
     with open(datasetName, "rb") as handle:
         loadedData = pickle.load(handle)
 
     def _padding(batch):
-        X, y, X_lens, y_lens, days = zip(*batch)
-        X_padded = pad_sequence(X, batch_first=True, padding_value=0)
-        y_padded = pad_sequence(y, batch_first=True, padding_value=0)
+        if diphone_vocab is not None:
+            # Unpack with diphone labels
+            X, y, X_lens, y_lens, days, y_diphone, y_diphone_lens = zip(*batch)
+            X_padded = pad_sequence(X, batch_first=True, padding_value=0)
+            y_padded = pad_sequence(y, batch_first=True, padding_value=0)
+            y_diphone_padded = pad_sequence(y_diphone, batch_first=True, padding_value=0)
 
-        return (
-            X_padded,
-            y_padded,
-            torch.stack(X_lens),
-            torch.stack(y_lens),
-            torch.stack(days),
-        )
+            return (
+                X_padded,
+                y_padded,
+                torch.stack(X_lens),
+                torch.stack(y_lens),
+                torch.stack(days),
+                y_diphone_padded,
+                torch.stack(y_diphone_lens),
+            )
+        else:
+            # Original format without diphones
+            X, y, X_lens, y_lens, days, _, _ = zip(*batch)
+            X_padded = pad_sequence(X, batch_first=True, padding_value=0)
+            y_padded = pad_sequence(y, batch_first=True, padding_value=0)
 
-    train_ds = SpeechDataset(loadedData["train"], transform=None)
-    test_ds = SpeechDataset(loadedData["test"])
+            return (
+                X_padded,
+                y_padded,
+                torch.stack(X_lens),
+                torch.stack(y_lens),
+                torch.stack(days),
+            )
+
+    train_ds = SpeechDataset(loadedData["train"], transform=None, diphone_vocab=diphone_vocab)
+    test_ds = SpeechDataset(loadedData["test"], diphone_vocab=diphone_vocab)
 
     train_loader = DataLoader(
         train_ds,
@@ -66,6 +86,36 @@ def _compute_output_lengths(model, x_lens):
         return ((x_lens - model.kernelLen) / model.strideLen).to(torch.int32)
 
 
+def _get_diphone_alpha(batch, total_batches, schedule="constant"):
+    """
+    Compute alpha weight for phoneme vs diphone loss.
+    alpha = 1.0 means 100% phoneme loss
+    alpha = 0.0 means 100% diphone loss
+
+    For joint training, we use:
+    loss = alpha * phoneme_loss + (1 - alpha) * diphone_loss
+    """
+    if schedule == "constant":
+        # Simple 50/50 weighting
+        return 0.5
+    elif schedule == "scheduled":
+        # Paper-style schedule:
+        # First 20%: alpha = 0.3 (lean more on diphones)
+        # Middle 60%: linearly ramp from 0.3 → 0.7
+        # Last 20%: alpha = 0.8 (focus more on phonemes)
+        progress = batch / total_batches
+        if progress < 0.2:
+            return 0.3
+        elif progress < 0.8:
+            # Linear ramp from 0.3 to 0.7 over middle 60%
+            ramp_progress = (progress - 0.2) / 0.6
+            return 0.3 + 0.4 * ramp_progress
+        else:
+            return 0.8
+    else:
+        return 0.5
+
+
 def trainModel(args):
     os.makedirs(args["outputDir"], exist_ok=True)
     torch.manual_seed(args["seed"])
@@ -82,12 +132,58 @@ def trainModel(args):
         name=os.path.basename(args["outputDir"]),
     )
 
+    # Load diphone vocabulary if diphone training is enabled
+    diphone_vocab = None
+    if args.get("use_diphone_head", False):
+        from neural_decoder.diphone_utils import DiphoneVocabulary
+        diphone_vocab_path = args.get("diphone_vocab_path", "/home/edward/neural_seq_decoder/diphone_vocab.pkl")
+        print(f"Loading diphone vocabulary from {diphone_vocab_path}")
+        diphone_vocab = DiphoneVocabulary.load(diphone_vocab_path)
+
     trainLoader, testLoader, loadedData = getDatasetLoaders(
         args["datasetPath"],
         args["batchSize"],
+        diphone_vocab=diphone_vocab,
     )
 
-    if args.get("model_type", "gru_baseline") == "transformer_ctc":
+    if args.get("model_type", "gru_baseline") == "advanced_multiscale":
+        from neural_decoder.advanced_multiscale import AdvancedMultiScaleDecoder
+        model = AdvancedMultiScaleDecoder(
+            n_classes=args["nClasses"] + 1,  # +1 for CTC blank
+            input_dim=args["nInputFeatures"],
+            d_model=args.get("latent_dim", 512),
+            encoder_layers=args.get("transformer_num_layers", 6),
+            n_heads=args.get("transformer_n_heads", 8),
+            dim_ff=args.get("transformer_dim_ff", 2048),
+            dropout=args.get("transformer_dropout", 0.1),
+            conv_kernel=args.get("conformer_conv_kernel", 31),
+            n_days=len(loadedData["train"]),
+            gaussian_smooth_width=args.get("gaussian_smooth_width", 0.0),
+            use_phonetic_features=args.get("use_phonetic_features", True),
+            use_contrastive=args.get("use_contrastive", True),
+            phonetic_loss_weight=args.get("phonetic_loss_weight", 0.2),
+            contrastive_loss_weight=args.get("contrastive_loss_weight", 0.1),
+            device=device,
+        ).to(device)
+    elif args.get("model_type", "gru_baseline") == "multiscale_ctc":
+        from neural_decoder.transformer_ctc import MultiScaleCTCDecoder
+        model = MultiScaleCTCDecoder(
+            n_classes=args["nClasses"] + 1,  # +1 for CTC blank
+            input_dim=args["nInputFeatures"],
+            d_model=args.get("latent_dim", 512),
+            encoder_layers=args.get("transformer_num_layers", 6),
+            n_heads=args.get("transformer_n_heads", 8),
+            dim_ff=args.get("transformer_dim_ff", 2048),
+            dropout=args.get("transformer_dropout", 0.1),
+            conv_kernel=args.get("conformer_conv_kernel", 31),
+            n_days=len(loadedData["train"]),
+            gaussian_smooth_width=args.get("gaussian_smooth_width", 0.0),
+            use_contrastive_pretraining=args.get("use_contrastive_pretraining", False),
+            use_diphone_head=args.get("use_diphone_head", False),
+            num_diphones=diphone_vocab.get_vocab_size() if diphone_vocab is not None else 1012,
+            device=device,
+        ).to(device)
+    elif args.get("model_type", "gru_baseline") == "transformer_ctc":
         model = NeuralTransformerCTCModel(
             n_channels=args["nInputFeatures"],
             n_classes=args["nClasses"] + 1,  # CTC blank already added in GRU; align dimensions
@@ -108,6 +204,9 @@ def trainModel(args):
             gaussian_smooth_width=args.get("gaussian_smooth_width", 0.0),
             use_conformer=args.get("use_conformer", False),
             conformer_conv_kernel=args.get("conformer_conv_kernel", 31),
+            use_relative_pe=args.get("use_relative_pe", True),
+            intermediate_ctc_layers=args.get("intermediate_ctc_layers", []),
+            stochastic_depth_rate=args.get("stochastic_depth_rate", 0.0),
             device=device,
         ).to(device)
     else:
@@ -179,7 +278,17 @@ def trainModel(args):
     for batch in range(args["nBatch"]):
         model.train()
 
-        X, y, X_len, y_len, dayIdx = next(iter(trainLoader))
+        # Unpack batch data (with or without diphone labels)
+        batch_data = next(iter(trainLoader))
+        if diphone_vocab is not None:
+            X, y, X_len, y_len, dayIdx, y_diphone, y_diphone_len = batch_data
+            y_diphone = y_diphone.to(device)
+            y_diphone_len = y_diphone_len.to(device)
+        else:
+            X, y, X_len, y_len, dayIdx = batch_data
+            y_diphone = None
+            y_diphone_len = None
+
         X, y, X_len, y_len, dayIdx = (
             X.to(device),
             y.to(device),
@@ -198,30 +307,182 @@ def trainModel(args):
                 * args["constantOffsetSD"]
             )
 
+        # SpecAugment-style time masking (proven powerful for speech)
+        time_mask_param = args.get("time_mask_param", 0)
+        if time_mask_param > 0 and batch % 2 == 0:  # Apply to 50% of batches
+            for i in range(X.shape[0]):
+                # Random time mask
+                t_length = X.shape[1]
+                t_mask_len = min(time_mask_param, t_length // 4)  # Max 25% of sequence
+                if t_mask_len > 0:
+                    t_start = torch.randint(0, t_length - t_mask_len + 1, (1,)).item()
+                    X[i, t_start:t_start + t_mask_len, :] = 0  # Mask with zeros
+
         # Compute prediction error
-        if args.get("model_type", "gru_baseline") == "transformer_ctc":
-            log_probs, out_lens = model(X, dayIdx, X_len)
+        model_type = args.get("model_type", "gru_baseline")
+
+        if model_type == "advanced_multiscale":
+            # Advanced multi-scale with auxiliary losses
+            model_output = model(X, dayIdx, X_len, phoneme_labels=y, return_auxiliary_losses=(batch % 10 == 0))
+
+            if len(model_output) == 3:
+                log_probs, out_lens, aux_outputs = model_output
+            else:
+                log_probs, out_lens = model_output
+                aux_outputs = {}
+
+            # Main CTC loss
+            loss = loss_ctc(log_probs, y, out_lens, y_len)
+
+            if label_smoothing > 0:
+                ctc_loss = torch.mean(loss)
+                uniform_dist = torch.full_like(log_probs, -math.log(n_classes))
+                kl_div = F.kl_div(log_probs, uniform_dist, reduction='batchmean', log_target=True)
+                loss = (1 - label_smoothing) * ctc_loss + label_smoothing * kl_div
+            else:
+                loss = torch.sum(loss)
+
+            # Add contrastive loss
+            if 'contrastive_loss' in aux_outputs:
+                contrastive_weight = args.get("contrastive_loss_weight", 0.1)
+                loss = loss + contrastive_weight * aux_outputs['contrastive_loss']
+
+        elif model_type == "multiscale_ctc":
+            # Multi-scale CTC model
+            # Optional: Contrastive pre-training phase
+            use_contrastive = args.get("use_contrastive_pretraining", False)
+            contrastive_warmup = args.get("contrastive_warmup_batches", 1000)
+
+            if use_contrastive and batch < contrastive_warmup:
+                # Contrastive pre-training phase
+                contrastive_loss = model(
+                    X, dayIdx, X_len,
+                    return_contrastive_loss=True
+                )
+                loss = contrastive_loss
+            else:
+                # Regular CTC training (with optional diphone auxiliary head)
+                model_output = model(X, dayIdx, X_len)
+
+                # Check if model returned diphone outputs
+                if len(model_output) == 3:
+                    phone_log_probs, out_lens, diphone_log_probs = model_output
+                    has_diphone = True
+                else:
+                    phone_log_probs, out_lens = model_output
+                    has_diphone = False
+
+                # Phoneme CTC loss
+                phone_loss = loss_ctc(
+                    phone_log_probs,
+                    y,
+                    out_lens,
+                    y_len,
+                )
+
+                # Apply label smoothing to phoneme loss if enabled
+                if label_smoothing > 0:
+                    phone_ctc_loss = torch.mean(phone_loss)
+                    uniform_dist = torch.full_like(phone_log_probs, -math.log(n_classes))
+                    kl_div = F.kl_div(phone_log_probs, uniform_dist, reduction='batchmean', log_target=True)
+                    phone_loss = (1 - label_smoothing) * phone_ctc_loss + label_smoothing * kl_div
+                else:
+                    phone_loss = torch.sum(phone_loss)
+
+                # Diphone CTC loss (if enabled)
+                if has_diphone and y_diphone is not None:
+                    # Create CTC loss for diphones (different blank token)
+                    diphone_blank_idx = diphone_vocab.blank_id
+                    if label_smoothing > 0:
+                        loss_ctc_diphone = torch.nn.CTCLoss(blank=diphone_blank_idx, reduction="none", zero_infinity=True)
+                    else:
+                        loss_ctc_diphone = torch.nn.CTCLoss(blank=diphone_blank_idx, reduction="mean", zero_infinity=True)
+
+                    diphone_loss = loss_ctc_diphone(
+                        diphone_log_probs,
+                        y_diphone,
+                        out_lens,
+                        y_diphone_len,
+                    )
+
+                    # Apply label smoothing to diphone loss if enabled
+                    if label_smoothing > 0:
+                        diphone_ctc_loss = torch.mean(diphone_loss)
+                        uniform_dist = torch.full_like(diphone_log_probs, -math.log(diphone_vocab.get_vocab_size()))
+                        kl_div = F.kl_div(diphone_log_probs, uniform_dist, reduction='batchmean', log_target=True)
+                        diphone_loss = (1 - label_smoothing) * diphone_ctc_loss + label_smoothing * kl_div
+                    else:
+                        diphone_loss = torch.sum(diphone_loss)
+
+                    # Joint loss with alpha weighting
+                    alpha = _get_diphone_alpha(
+                        batch,
+                        args["nBatch"],
+                        schedule=args.get("diphone_alpha_schedule", "constant")
+                    )
+                    loss = alpha * phone_loss + (1.0 - alpha) * diphone_loss
+
+                    # Log individual losses for monitoring
+                    if batch % 100 == 0:
+                        wandb.log({
+                            "train/phone_loss": phone_loss.item(),
+                            "train/diphone_loss": diphone_loss.item(),
+                            "train/alpha": alpha,
+                        })
+                else:
+                    # No diphone loss, use only phoneme loss
+                    loss = phone_loss
+
+        elif model_type == "transformer_ctc":
+            model_output = model(X, dayIdx, X_len)
+            # Handle both (log_probs, out_lens) and (log_probs, out_lens, intermediate_outputs)
+            if len(model_output) == 3:
+                log_probs, out_lens, intermediate_outputs = model_output
+            else:
+                log_probs, out_lens = model_output
+                intermediate_outputs = {}
+
+            loss = loss_ctc(
+                log_probs,
+                y,
+                out_lens,
+                y_len,
+            )
+
+            # Apply label smoothing if enabled
+            if label_smoothing > 0:
+                # CTC loss + uniform distribution over non-blank classes
+                ctc_loss = torch.mean(loss)
+                # Compute KL divergence from uniform distribution (label smoothing)
+                uniform_dist = torch.full_like(log_probs, -math.log(n_classes))
+                kl_div = F.kl_div(log_probs, uniform_dist, reduction='batchmean', log_target=True)
+                loss = (1 - label_smoothing) * ctc_loss + label_smoothing * kl_div
+            else:
+                loss = torch.sum(loss)
+
+            # Add intermediate CTC losses (improves gradient flow in deep models)
+            if intermediate_outputs:
+                intermediate_weight = args.get("intermediate_loss_weight", 0.3)
+                for layer_name, intermediate_log_probs in intermediate_outputs.items():
+                    intermediate_loss = loss_ctc(intermediate_log_probs, y, out_lens, y_len)
+                    if label_smoothing > 0:
+                        intermediate_loss = torch.mean(intermediate_loss)
+                    else:
+                        intermediate_loss = torch.sum(intermediate_loss)
+                    loss = loss + intermediate_weight * intermediate_loss
+
         else:
+            # GRU baseline
             pred = model.forward(X, dayIdx)
             out_lens = ((X_len - model.kernelLen) / model.strideLen).to(torch.int32)
             log_probs = pred.log_softmax(2).permute(1, 0, 2)
 
-        loss = loss_ctc(
-            log_probs,
-            y,
-            out_lens,
-            y_len,
-        )
-
-        # Apply label smoothing if enabled
-        if label_smoothing > 0:
-            # CTC loss + uniform distribution over non-blank classes
-            ctc_loss = torch.mean(loss)
-            # Compute KL divergence from uniform distribution (label smoothing)
-            uniform_dist = torch.full_like(log_probs, -math.log(n_classes))
-            kl_div = F.kl_div(log_probs, uniform_dist, reduction='batchmean', log_target=True)
-            loss = (1 - label_smoothing) * ctc_loss + label_smoothing * kl_div
-        else:
+            loss = loss_ctc(
+                log_probs,
+                y,
+                out_lens,
+                y_len,
+            )
             loss = torch.sum(loss)
 
         # Backpropagation
@@ -229,7 +490,8 @@ def trainModel(args):
         loss.backward()
 
         # Gradient clipping to prevent explosion
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_clip_norm = args.get("grad_clip_norm", 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
 
         optimizer.step()
         scheduler.step()
@@ -248,7 +510,13 @@ def trainModel(args):
                 allLoss = []
                 total_edit_distance = 0
                 total_seq_length = 0
-                for X, y, X_len, y_len, testDayIdx in testLoader:
+                for test_batch_data in testLoader:
+                    # Handle both 5-tuple (no diphone) and 7-tuple (with diphone) formats
+                    if diphone_vocab is not None:
+                        X, y, X_len, y_len, testDayIdx, _, _ = test_batch_data
+                    else:
+                        X, y, X_len, y_len, testDayIdx = test_batch_data
+
                     X, y, X_len, y_len, testDayIdx = (
                         X.to(device),
                         y.to(device),
@@ -257,43 +525,145 @@ def trainModel(args):
                         testDayIdx.to(device),
                     )
 
-                    if args.get("model_type", "gru_baseline") == "transformer_ctc":
+                    if model_type == "advanced_multiscale":
+                        # Advanced multi-scale (same as multiscale_ctc for evaluation)
+                        pred, adjustedLens = model(X, testDayIdx, X_len)
+                        # pred is [T, B, C]
+
+                        loss = loss_ctc(
+                            pred,
+                            y,
+                            adjustedLens,
+                            y_len,
+                        )
+                        loss = torch.sum(loss)
+                        allLoss.append(loss.cpu().detach().numpy())
+
+                        for iterIdx in range(pred.shape[1]):  # pred is [T, B, C]
+                            decodedSeq = torch.argmax(
+                                torch.tensor(pred[0 : adjustedLens[iterIdx], iterIdx, :]),
+                                dim=-1,
+                            )  # [num_seq,]
+                            decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
+                            decodedSeq = decodedSeq.cpu().detach().numpy()
+                            decodedSeq = np.array([i for i in decodedSeq if i != 0])
+
+                            trueSeq = np.array(
+                                y[iterIdx][0 : y_len[iterIdx]].cpu().detach()
+                            )
+
+                            matcher = SequenceMatcher(
+                                a=trueSeq.tolist(), b=decodedSeq.tolist()
+                            )
+                            total_edit_distance += matcher.distance()
+                            total_seq_length += len(trueSeq)
+
+                    elif model_type == "multiscale_ctc":
+                        # Multi-scale CTC decoding (handle both with and without diphone head)
+                        model_output = model(X, testDayIdx, X_len)
+
+                        # Unpack output (may have 2 or 3 tensors)
+                        if len(model_output) == 3:
+                            pred, adjustedLens, _ = model_output  # Ignore diphone output during eval
+                        else:
+                            pred, adjustedLens = model_output
+                        # pred is [T, B, C]
+
+                        loss = loss_ctc(
+                            pred,
+                            y,
+                            adjustedLens,
+                            y_len,
+                        )
+                        loss = torch.sum(loss)
+                        allLoss.append(loss.cpu().detach().numpy())
+
+                        for iterIdx in range(pred.shape[1]):  # pred is [T, B, C]
+                            decodedSeq = torch.argmax(
+                                torch.tensor(pred[0 : adjustedLens[iterIdx], iterIdx, :]),
+                                dim=-1,
+                            )  # [num_seq,]
+                            decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
+                            decodedSeq = decodedSeq.cpu().detach().numpy()
+                            decodedSeq = np.array([i for i in decodedSeq if i != 0])
+
+                            trueSeq = np.array(
+                                y[iterIdx][0 : y_len[iterIdx]].cpu().detach()
+                            )
+
+                            matcher = SequenceMatcher(
+                                a=trueSeq.tolist(), b=decodedSeq.tolist()
+                            )
+                            total_edit_distance += matcher.distance()
+                            total_seq_length += len(trueSeq)
+
+                    elif model_type == "transformer_ctc":
                         pred, adjustedLens = model(X, testDayIdx, X_len)
                         # pred already [T, B, C]
+
+                        loss = loss_ctc(
+                            pred,
+                            y,
+                            adjustedLens,
+                            y_len,
+                        )
+                        loss = torch.sum(loss)
+                        allLoss.append(loss.cpu().detach().numpy())
+
+                        for iterIdx in range(pred.shape[1]):  # pred is [T, B, C]
+                            decodedSeq = torch.argmax(
+                                torch.tensor(pred[0 : adjustedLens[iterIdx], iterIdx, :]),
+                                dim=-1,
+                            )  # [num_seq,]
+                            decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
+                            decodedSeq = decodedSeq.cpu().detach().numpy()
+                            decodedSeq = np.array([i for i in decodedSeq if i != 0])
+
+                            trueSeq = np.array(
+                                y[iterIdx][0 : y_len[iterIdx]].cpu().detach()
+                            )
+
+                            matcher = SequenceMatcher(
+                                a=trueSeq.tolist(), b=decodedSeq.tolist()
+                            )
+                            total_edit_distance += matcher.distance()
+                            total_seq_length += len(trueSeq)
+
                     else:
+                        # GRU baseline
                         logits = model.forward(X, testDayIdx)
                         adjustedLens = ((X_len - model.kernelLen) / model.strideLen).to(
                             torch.int32
                         )
                         pred = logits.log_softmax(2).permute(1, 0, 2)
 
-                    loss = loss_ctc(
-                        pred,
-                        y,
-                        adjustedLens,
-                        y_len,
-                    )
-                    loss = torch.sum(loss)
-                    allLoss.append(loss.cpu().detach().numpy())
-
-                    for iterIdx in range(pred.shape[1]):  # pred is [T, B, C]
-                        decodedSeq = torch.argmax(
-                            torch.tensor(pred[0 : adjustedLens[iterIdx], iterIdx, :]),
-                            dim=-1,
-                        )  # [num_seq,]
-                        decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
-                        decodedSeq = decodedSeq.cpu().detach().numpy()
-                        decodedSeq = np.array([i for i in decodedSeq if i != 0])
-
-                        trueSeq = np.array(
-                            y[iterIdx][0 : y_len[iterIdx]].cpu().detach()
+                        loss = loss_ctc(
+                            pred,
+                            y,
+                            adjustedLens,
+                            y_len,
                         )
+                        loss = torch.sum(loss)
+                        allLoss.append(loss.cpu().detach().numpy())
 
-                        matcher = SequenceMatcher(
-                            a=trueSeq.tolist(), b=decodedSeq.tolist()
-                        )
-                        total_edit_distance += matcher.distance()
-                        total_seq_length += len(trueSeq)
+                        for iterIdx in range(pred.shape[1]):  # pred is [T, B, C]
+                            decodedSeq = torch.argmax(
+                                torch.tensor(pred[0 : adjustedLens[iterIdx], iterIdx, :]),
+                                dim=-1,
+                            )  # [num_seq,]
+                            decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
+                            decodedSeq = decodedSeq.cpu().detach().numpy()
+                            decodedSeq = np.array([i for i in decodedSeq if i != 0])
+
+                            trueSeq = np.array(
+                                y[iterIdx][0 : y_len[iterIdx]].cpu().detach()
+                            )
+
+                            matcher = SequenceMatcher(
+                                a=trueSeq.tolist(), b=decodedSeq.tolist()
+                            )
+                            total_edit_distance += matcher.distance()
+                            total_seq_length += len(trueSeq)
 
                 avgDayLoss = np.sum(allLoss) / len(testLoader)
                 cer = total_edit_distance / total_seq_length
@@ -357,6 +727,9 @@ def loadModel(modelDir, nInputLayers=24, device="cuda"):
             gaussian_smooth_width=args.get("gaussian_smooth_width", 0.0),
             use_conformer=args.get("use_conformer", False),
             conformer_conv_kernel=args.get("conformer_conv_kernel", 31),
+            use_relative_pe=args.get("use_relative_pe", True),
+            intermediate_ctc_layers=args.get("intermediate_ctc_layers", []),
+            stochastic_depth_rate=args.get("stochastic_depth_rate", 0.0),
             device=device,
         ).to(device)
     else:
