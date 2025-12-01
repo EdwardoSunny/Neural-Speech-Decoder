@@ -19,7 +19,7 @@ args['maxTimeSeriesLen'] = 1200
 args['batchSize'] = 64
 
 # Aggressive but proven-stable LR
-args['lrStart'] = 0.003
+args['lrStart'] = 0.0025
 args['lrEnd'] = 0.00005
 args['nUnits'] = 1024
 args['nBatch'] = 150000
@@ -51,9 +51,9 @@ args['optimizer'] = 'adamw'
 args['weight_decay'] = 1e-3
 
 # ===========================================================================
-# FIX #4: Shorter warmup (5k) - model learns fast early
+# FIX #4: Moderate warmup (7k) - reach effective LR but with more ramp
 # ===========================================================================
-args['warmup_steps'] = 5000  # Faster ramp to effective learning rate
+args['warmup_steps'] = 7000  # Slightly longer ramp for stability
 
 # ===========================================================================
 # FIX #5: More conservative grad clipping (1.0 not 1.5)
@@ -61,9 +61,9 @@ args['warmup_steps'] = 5000  # Faster ramp to effective learning rate
 args['grad_clip_norm'] = 1.0  # More stable
 
 # ===========================================================================
-# FIX #3: No label smoothing early - keep gradients sharp
+# FIX #3: Light label smoothing for stability
 # ===========================================================================
-args['label_smoothing'] = 0.0  # Let gradients stay sharp early
+args['label_smoothing'] = 0.01
 
 args['time_mask_param'] = 20
 
@@ -76,7 +76,7 @@ args['use_diphone_marginalization'] = True
 # FIX #1: CONSTANT alpha (phoneme-biased) - prevents loss instability
 # ===========================================================================
 args['diphone_alpha_schedule'] = 'constant'  # Stable weighting throughout
-args['diphone_alpha_constant'] = 0.7  # Bias toward phoneme loss early
+args['diphone_alpha_constant'] = 0.6  # Bias toward phoneme loss early
 
 # ===========================================================================
 # FIX #2: Balanced auxiliary weights (0.1 keeps focus on main head)
