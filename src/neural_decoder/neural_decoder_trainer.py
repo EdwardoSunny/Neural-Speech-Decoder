@@ -681,7 +681,7 @@ def trainModel(args):
 
                         for iterIdx in range(pred.shape[1]):  # pred is [T, B, C]
                             decodedSeq = torch.argmax(
-                                torch.tensor(pred[0 : adjustedLens[iterIdx], iterIdx, :]),
+                                pred[0 : adjustedLens[iterIdx], iterIdx, :].clone().detach(),
                                 dim=-1,
                             )  # [num_seq,]
                             decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
@@ -726,7 +726,7 @@ def trainModel(args):
 
                         for iterIdx in range(pred.shape[1]):  # pred is [T, B, C]
                             decodedSeq = torch.argmax(
-                                torch.tensor(pred[0 : adjustedLens[iterIdx], iterIdx, :]),
+                                pred[0 : adjustedLens[iterIdx], iterIdx, :].clone().detach(),
                                 dim=-1,
                             )  # [num_seq,]
                             decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
@@ -758,7 +758,7 @@ def trainModel(args):
 
                         for iterIdx in range(pred.shape[1]):  # pred is [T, B, C]
                             decodedSeq = torch.argmax(
-                                torch.tensor(pred[0 : adjustedLens[iterIdx], iterIdx, :]),
+                                pred[0 : adjustedLens[iterIdx], iterIdx, :].clone().detach(),
                                 dim=-1,
                             )  # [num_seq,]
                             decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
@@ -794,7 +794,7 @@ def trainModel(args):
 
                         for iterIdx in range(pred.shape[1]):  # pred is [T, B, C]
                             decodedSeq = torch.argmax(
-                                torch.tensor(pred[0 : adjustedLens[iterIdx], iterIdx, :]),
+                                pred[0 : adjustedLens[iterIdx], iterIdx, :].clone().detach(),
                                 dim=-1,
                             )  # [num_seq,]
                             decodedSeq = torch.unique_consecutive(decodedSeq, dim=-1)
