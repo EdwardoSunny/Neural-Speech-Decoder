@@ -1,11 +1,11 @@
 """
-FINAL OPTIMIZED Training Script (faster convergence)
+FINAL OPTIMIZED Training Script (balanced for stability and speed)
 
 Key choices:
-1. Constant alpha with phoneme bias (0.7) - speeds CER improvements
+1. Constant alpha with phoneme bias (0.6) - speeds CER without over-shooting
 2. Multi-scale lambda 0.1 - auxiliary heads help without dominating
-3. No label smoothing early - keep gradients sharp
-4. Short warmup 5k - reach effective LR quickly
+3. Light label smoothing 0.01 - small stability boost
+4. Moderate warmup 7k - reach effective LR with gentle ramp
 5. Grad clip 1.0 - stable updates
 """
 
@@ -91,17 +91,17 @@ print("=" * 80)
 print(f"Model: {modelName}")
 print()
 print("ALL LOGIC FIXES APPLIED:")
-print(f"  1. ✓ diphone_alpha = 'constant' (phoneme-biased 0.7 - STABLE)")
+print(f"  1. ✓ diphone_alpha = 'constant' (phoneme-biased 0.6 - STABLE)")
 print(f"  2. ✓ multiscale_lambda = 0.1 (auxiliary but not dominant)")
-print(f"  3. ✓ label_smoothing = 0.0 (sharp gradients early)")
-print(f"  4. ✓ warmup_steps = 5k (reach peak LR faster)")
+print(f"  3. ✓ label_smoothing = 0.01 (light smoothing for stability)")
+print(f"  4. ✓ warmup_steps = 7k (reach peak LR with gentle ramp)")
 print(f"  5. ✓ grad_clip_norm = 1.0 (not 1.5 - MORE STABLE)")
 print()
 print("WHY THESE FIXES:")
 print("  Issue 1: Scheduled alpha caused loss to increase (moving target)")
 print("  Issue 2: Aux weight too weak/strong; 0.1 keeps focus on main head")
-print("  Issue 3: Early smoothing can slow convergence; off for now")
-print("  Issue 4: Very long warmup slows learning")
+print("  Issue 3: Tiny smoothing helps stability without slowing too much")
+print("  Issue 4: Very long warmup slows learning; moderate ramp balances speed/stability")
 print("  Issue 5: 1.5 grad clip less stable than 1.0")
 print()
 print("EXPECTED: Faster early CER drop, stable training, better final CER")

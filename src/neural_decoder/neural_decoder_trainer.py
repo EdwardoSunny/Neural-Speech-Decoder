@@ -444,12 +444,12 @@ def trainModel(args):
 
                         # JOINT LOSS with alpha weighting (proper DCoND Step 2!)
                         # Both losses provide gradient signal to the same diphone_head
-                            alpha = _get_diphone_alpha(
-                                batch,
-                                args["nBatch"],
-                                schedule=args.get("diphone_alpha_schedule", "constant"),
-                                constant_alpha=args.get("diphone_alpha_constant", 0.5),
-                            )
+                        alpha = _get_diphone_alpha(
+                            batch,
+                            args["nBatch"],
+                            schedule=args.get("diphone_alpha_schedule", "constant"),
+                            constant_alpha=args.get("diphone_alpha_constant", 0.5),
+                        )
                         loss = alpha * phone_loss + (1.0 - alpha) * diphone_loss
 
                         # STEP 3: Add multi-scale auxiliary losses if enabled
