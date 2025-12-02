@@ -18,11 +18,11 @@ args['seqLen'] = 150
 args['maxTimeSeriesLen'] = 1200
 args['batchSize'] = 64
 
-# Requested LR peak (lowered)
-args['lrStart'] = 0.0008
+# Peak LR per request
+args['lrStart'] = 0.001
 args['lrEnd'] = 0.00005
 args['nUnits'] = 1024
-args['nBatch'] = 200000
+args['nBatch'] = 250000
 args['nLayers'] = 5
 args['seed'] = 0
 args['nClasses'] = 40
@@ -53,9 +53,9 @@ args['optimizer'] = 'adamw'
 args['weight_decay'] = 1e-3
 
 # ===========================================================================
-# FIX #4: Warmup per request (2k) - shorter ramp
+# FIX #4: Warmup per request (15k) - longer stabilization
 # ===========================================================================
-args['warmup_steps'] = 2000
+args['warmup_steps'] = 15000
 
 # ===========================================================================
 # FIX #5: More conservative grad clipping (1.0 not 1.5)
@@ -96,7 +96,7 @@ print("ALL LOGIC FIXES APPLIED:")
 print(f"  1. ✓ diphone_alpha = 'constant' (phoneme-biased 0.65 - STABLE)")
 print(f"  2. ✓ multiscale_lambda = 0.1 (auxiliary but not dominant)")
 print(f"  3. ✓ label_smoothing = 0.01 (light smoothing for stability)")
-print(f"  4. ✓ warmup_steps = 2k (short ramp, low peak LR)")
+print(f"  4. ✓ warmup_steps = 15k (longer stabilization ramp)")
 print(f"  5. ✓ grad_clip_norm = 1.0 (not 1.5 - MORE STABLE)")
 print()
 print("WHY THESE FIXES:")
